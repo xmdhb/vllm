@@ -1,0 +1,258 @@
+# 架构概览（Architecture Overview）中文翻译
+
+本文档提供 vLLM 架构的总体概览。
+
+[TOC]
+
+================================================================================
+入口点（Entrypoints）
+================================================================================
+
+vLLM 提供了多种与系统交互的入口点。下图展示了它们之间的关系：
+
+![入口点示意图](../assets/design/arch_overview/entrypoints.excalidraw.png)
+
+## LLM 类
+
+LLM 类是进行离线推理的主要 Python 接口，即直接与模型交互而无需使用独立的模型推理服务器。
+
+以下是 LLM 类的一个使用示例：
+
+```python
+from vllm import LLM, SamplingParams
+
+# 定义一组输入提示词
+prompts = [
+    "Hello, my name is",
+    "The capital of France is",
+    "The largest ocean is",
+]
+
+# 定义采样参数
+sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+
+# 使用 OPT-125M 模型初始化 LLM 引擎
+llm = LLM(model="facebook/opt-125m")
+
+# 为输入提示词生成输出
+outputs = llm.generate(prompts, sampling_params)
+
+# 打印生成的输出
+for output in outputs:
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+```
+
+更多 API 细节可在 API 文档的"离线推理"部分找到。
+
+LLM 类的代码位于 vllm/entrypoints/llm.py。
+
+## 在线服务（Online Serving）
+
+vLLM 的第二个主要接口是通过其在线服务器。可以使用 vllm serve 命令启动该服务器：
+
+```bash
+vllm serve <model>
+```
+
+vllm CLI 的代码位于 vllm/entrypoints/cli/main.py。
+
+有时你可能会看到直接使用 API 服务器入口点，而非通过 vllm CLI 命令，例如：
+
+```bash
+python -m vllm.entrypoints.openai.api_server --model <model>
+```
+
+!!! warning
+    python -m vllm.entrypoints.openai.api_server 已废弃，可能在未来的版本中被移除。
+
+该代码位于 vllm/entrypoints/openai/api_server.py。
+
+有关 API 服务器的更多细节，请参阅"在线服务"文档。
+
+================================================================================
+V1 进程架构
+================================================================================
+
+vLLM V1 采用多进程架构来分离关注点并最大化吞吐量。理解这一架构对于正确规划部署中的 CPU 资源规模至关重要。关键进程包括：
+
+## API Server 进程
+
+API Server 进程负责处理 HTTP 请求（例如，OpenAI 兼容 API）、执行输入处理（分词、多模态数据加载），并将结果流式传输回客户端。它通过 ZMQ Socket 与一个或多个 Engine Core 进程通信。
+
+默认情况下有 1 个 API Server 进程，但当启用数据并行时，API Server 的数量会自动扩展以匹配数据并行大小。也可以通过 --api-server-count 标志手动配置。每个 API Server 通过 ZMQ 以多对多拓扑连接到所有 Engine Core，使任何 API Server 都能将请求路由到任何 Engine Core。每个 API Server 进程使用多个 CPU 线程进行媒体加载（由 VLLM_MEDIA_LOADING_THREAD_COUNT 控制，默认为 8）。
+
+代码位于 vllm/entrypoints/openai/api_server.py 和 vllm/v1/utils.py。
+
+## Engine Core 进程
+
+Engine Core 进程运行调度器（Scheduler），管理 KV Cache，并协调跨 GPU Worker 的模型执行。它运行一个忙循环（busy loop），持续调度请求并将工作分派给 GPU Worker。
+
+每个数据并行秩（data parallel rank）对应 1 个 Engine Core 进程。例如，使用 --data-parallel-size 4 时，会有 4 个 Engine Core 进程。
+
+代码位于 vllm/v1/engine/core.py 和 vllm/v1/engine/utils.py。
+
+## GPU Worker 进程
+
+每个 GPU 由一个专用的 Worker 进程管理。Worker 进程负责加载模型权重、执行前向传播（forward pass）以及管理 GPU 内存。Worker 与拥有它的 Engine Core 进程通信。
+
+每块 GPU 对应 1 个 Worker 进程。GPU Worker 进程的总数等于每个 Engine Core 的 tensor_parallel_size × pipeline_parallel_size。
+
+代码位于 vllm/v1/executor/multiproc_executor.py 和 vllm/v1/worker/gpu_worker.py。
+
+## DP Coordinator 进程（有条件启用）
+
+当使用数据并行（--data-parallel-size > 1）时，会有一个额外的协调器（Coordinator）进程，负责管理跨 DP 秩的负载均衡，并协调 MoE 模型的同步前向传播。
+
+当启用数据并行时，有 1 个 DP Coordinator 进程。
+
+代码位于 vllm/v1/engine/coordinator.py。
+
+## 进程数量总结
+
+对于一个拥有 N 块 GPU、TP 张量并行大小、DP 数据并行大小以及 A 个 API Server 数量的部署：
+
+| 进程类型      | 数量                        | 说明                               |
+|--------------|----------------------------|------------------------------------|
+| API Server   | A（默认等于 DP）              | 处理 HTTP 请求和输入处理             |
+| Engine Core  | DP（默认为 1）               | 调度器和 KV Cache 管理              |
+| GPU Worker   | N（= DP × PP × TP）          | 每 GPU 一个，执行模型前向传播         |
+| DP Coordinator | 若 DP > 1 则为 1，否则为 0   | 跨 DP 秩的负载均衡                  |
+| 总计         | A + DP + N（若 DP > 1 则 +1） |                                    |
+
+例如，一个典型的 4 GPU 单节点部署（vllm serve -tp=4）包含：
+
+- 1 个 API Server + 1 个 Engine Core + 4 个 GPU Worker = 6 个进程
+
+<figure markdown="1">
+![V1 进程架构 - TP=4](../assets/design/arch_overview/v1_process_architecture_tp4.png)
+</figure>
+
+一个 8 GPU 数据并行部署（vllm serve -tp=2 -dp=4）包含：
+
+- 4 个 API Server + 4 个 Engine Core + 8 个 GPU Worker + 1 个 DP Coordinator = 17 个进程
+
+<figure markdown="1">
+![V1 进程架构 - TP=2, DP=4](../assets/design/arch_overview/v1_process_architecture_tp2_dp4.png)
+</figure>
+
+关于 CPU 资源规模建议，请参阅"GPU 部署的 CPU 资源"文档。
+
+================================================================================
+LLM Engine
+================================================================================
+
+LLMEngine 和 AsyncLLMEngine 类是 vLLM 系统运作的核心，负责模型推理和异步请求处理。
+
+![LLMEngine 示意图](../assets/design/arch_overview/llm_engine.excalidraw.png)
+
+## LLMEngine
+
+LLMEngine 类是 vLLM 引擎的核心组件。它负责接收来自客户端的请求，并从模型生成输出。LLMEngine 涵盖输入处理、模型执行（可能跨多台主机和/或 GPU 分布）、调度以及输出处理。
+
+- 输入处理（Input Processing）：使用指定的 Tokenizer 对输入文本进行分词。
+- 调度（Scheduling）：在每个 step 中选择处理哪些请求。
+- 模型执行（Model Execution）：管理语言模型的执行，包括跨多 GPU 的分布式执行。
+- 输出处理（Output Processing）：处理模型生成的输出，将 Token ID 解码为人类可读的文本。
+
+LLMEngine 的代码位于 vllm/engine/llm_engine.py。
+
+## AsyncLLMEngine
+
+AsyncLLMEngine 类是 LLMEngine 类的异步包装器。它使用 asyncio 创建一个后台循环，持续处理传入的请求。AsyncLLMEngine 专为在线服务设计，可以同时处理多个并发请求并将输出流式传输给客户端。
+
+OpenAI 兼容的 API 服务器使用 AsyncLLMEngine。在 vllm/entrypoints/api_server.py 中还有一个更简单的示例 API 服务器作为演示。
+
+AsyncLLMEngine 的代码位于 vllm/engine/async_llm_engine.py。
+
+================================================================================
+Worker
+================================================================================
+
+Worker 是运行模型推理的进程。vLLM 遵循业界常见做法，使用一个进程控制一个加速器设备（如 GPU）。例如，如果使用张量并行大小为 2、流水线并行大小为 2，则总共会有 4 个 Worker。Worker 通过 rank 和 local_rank 来标识。rank 用于全局编排，而 local_rank 主要用于分配加速器设备以及访问本地资源（如文件系统和共享内存）。
+
+================================================================================
+Model Runner
+================================================================================
+
+每个 Worker 都有一个 Model Runner 对象，负责加载和运行模型。大部分模型执行逻辑都位于此处，例如准备输入 Tensor 和捕获 CUDA Graph。
+
+================================================================================
+Model
+================================================================================
+
+每个 Model Runner 对象都有一个 Model 对象，即实际的 torch.nn.Module 实例。关于各种配置如何影响最终获取到的类，请参阅 huggingface_integration 文档。
+
+================================================================================
+类层次结构（Class Hierarchy）
+================================================================================
+
+下图展示了 vLLM 的类层次结构：
+
+![类层次结构](../assets/design/hierarchy.png)
+
+这一层次结构背后有几个重要的设计决策：
+
+## 1. 可扩展性（Extensibility）
+
+层次结构中的所有类都接受一个包含所有必要信息的配置对象。VllmConfig 类是主要的配置对象，在各组件之间传递。类层次结构相当深，每个类都需要读取它所关心的配置。通过将所有配置封装在一个对象中，我们可以轻松地在各处传递配置对象并访问所需的配置。
+
+假设我们想添加一个新功能（考虑到 LLM 推理领域发展之快，这经常发生），且该功能仅涉及 Model Runner。我们需要在 VllmConfig 类中添加一个新的配置选项。由于我们在各处传递整个配置对象，只需要在 VllmConfig 类中添加该配置选项，Model Runner 就可以直接访问它。我们无需修改 Engine、Worker 或 Model 类的构造函数来传递新的配置选项。
+
+## 2. 统一性（Uniformity）
+
+Model Runner 需要一个统一的接口来创建和初始化模型。vLLM 支持超过 50 种主流开源模型，每种模型都有各自的初始化逻辑。如果构造函数的签名因模型而异，Model Runner 就无法知道如何正确调用构造函数，除非依赖复杂且容易出错的检测逻辑。
+
+通过使 Model 类的构造函数保持统一，Model Runner 可以轻松创建和初始化模型，而无需知道具体的模型类型。这对于组合模型也非常有用。视觉-语言模型通常由一个视觉模型和一个语言模型组成。通过使构造函数统一，我们可以轻松创建视觉模型和语言模型，并将它们组合成一个视觉-语言模型。
+
+!!! note
+    为支持这一变更，所有 vLLM 模型的签名已更新为：
+
+    ```python
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    ```
+
+    为避免意外传入不正确的参数，构造函数现在是仅限关键字参数（keyword-only）。这确保如果传入旧的配置参数，构造函数会直接报错。vLLM 开发者已对 vLLM 内的所有模型完成了此更改。对于树外注册的模型（out-of-tree registered models），开发者需要更新其模型，例如通过添加适配代码，将旧的构造函数签名适配到新的签名：
+
+    ```python
+    class MyOldModel(nn.Module):
+        def __init__(
+            self,
+            config,
+            cache_config: Optional[CacheConfig] = None,
+            quant_config: Optional[QuantizationConfig] = None,
+            lora_config: Optional[LoRAConfig] = None,
+            prefix: str = "",
+        ) -> None:
+            ...
+
+    from vllm.config import VllmConfig
+    class MyNewModel(MyOldModel):
+        def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+            config = vllm_config.model_config.hf_config
+            cache_config = vllm_config.cache_config
+            quant_config = vllm_config.quant_config
+            lora_config = vllm_config.lora_config
+            super().__init__(config, cache_config, quant_config, lora_config, prefix)
+
+    from packaging import version
+    if version.parse(__version__) >= version.parse("0.6.4"):
+        MyModel = MyNewModel
+    else:
+        MyModel = MyOldModel
+    ```
+
+    这样，模型可以同时兼容 vLLM 新旧两个版本。
+
+## 3. 初始化时进行分片和量化（Sharding and Quantization at Initialization）
+
+某些功能需要修改模型权重。例如，张量并行需要对模型权重进行分片，量化需要对模型权重进行量化。实现这些功能有两种方式：一是在模型初始化之后修改权重；二是在模型初始化期间修改权重。vLLM 选择后者。
+
+第一种方法无法扩展到大型模型。假设我们想用 16 块 H100 80GB GPU 运行一个 405B 模型（约 810GB 权重）。理想情况下，每块 GPU 只需加载 50GB 权重。如果在模型初始化后再修改权重，我们需要将完整的 810GB 权重加载到每块 GPU，然后再对其进行分片，这将导致巨大的内存开销。相比之下，如果在模型初始化期间进行分片，每一层只会创建其所需的权重分片，从而大幅降低内存开销。同样的思路也适用于量化。
+
+值得注意的是，我们还向模型的构造函数中添加了一个额外的参数 prefix，使模型能够根据前缀以不同的方式初始化自身。这对于非均匀量化非常有用，因为模型的不同部分可能采用不同的量化方式。prefix 对于顶层模型通常为空字符串，对于子模型则为类似 "vision" 或 "language" 的字符串。通常，它与模块在检查点文件中的状态字典（state dict）名称相匹配。
+
+这种设计的一个缺点是，很难为 vLLM 中的单个组件编写单元测试，因为每个组件都需要由完整的配置对象来初始化。我们通过提供一个默认初始化函数来解决这个问题，该函数创建一个所有字段都设为 None 的默认配置对象。如果我们想测试的组件只关心配置对象中的少数几个字段，我们可以创建一个默认配置对象并设置我们关心的字段。这样，我们就可以隔离地测试该组件。需要注意的是，vLLM 中的许多测试都是测试整个系统的端到端测试，因此这并非一个大问题。
+
+总而言之，完整的配置对象 VllmConfig 可以被视为一个引擎级别的全局状态，在所有 vLLM 类之间共享。
